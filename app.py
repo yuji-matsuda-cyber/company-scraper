@@ -8,8 +8,8 @@ import io
 import zipfile
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+# from selenium.webdriver.chrome.service import Service # <-- Streamlit Cloud用に削除
+# from webdriver_manager.chrome import ChromeDriverManager # <-- Streamlit Cloud用に削除
 from selenium.webdriver.chrome.options import Options
 from urllib.parse import urljoin, quote_plus
 from selenium.webdriver.common.by import By
@@ -188,7 +188,7 @@ def search_yahoo_for_phone(query, driver, area_codes_set, sorted_area_codes, sta
 
         for block in result_blocks[:5]:
             block_text = block.get_text()
-            translation_table = str.maketrans('０１２３４５６７８９（）－‐　', '0123456789()-- ')
+            translation_table = str.maketrans('０１２３４５６７８９（）－‐S', '0123456789()-- ')
             normalized_text = block_text.translate(translation_table)
 
             pattern1 = r'(?:電話番号|電話|TEL)\s*[.:：]?\s*(0\d{1,4}[-()（）\s]{1,3}\d{1,4}[-()（）\s]{1,3}\d{3,4})'
@@ -273,7 +273,7 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
         options = Options()
         options.add_argument(f'user-agent={random.choice(USER_AGENTS)}')
         options.add_argument('--blink-settings=imagesEnabled=false')
-        if not disable_headless: options.add_argument('--headless=new')
+        # if not disable_headless: options.add_argument('--headless=new') # <-- 元のコード
         options.add_argument(f'--window-size=1920,1980')
         options.add_argument('--disable-gpu'); options.add_argument('--lang=ja-JP,ja;q=0.9')
         options.add_argument("--disable-blink-features=AutomationControlled")
@@ -287,12 +287,23 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
             except Exception as e:
                 st.error(f"プロキシ設定エラー: {e}")
 
+        # --- ▼▼▼ Streamlit Cloud デプロイ用に修正 ▼▼▼ ---
+        options.add_argument('--headless=new') # ヘッドレスモードを強制
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+
+        if not disable_headless:
+            st.info("（デプロイ環境ではヘッドレスモードが強制されます）")
+        
         try: 
-             service = Service(ChromeDriverManager().install());
-             driver = webdriver.Chrome(service=service, options=options)
-             driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined})'})
+             # service = Service(ChromeDriverManager().install()); # <-- 削除
+             # webdriver-manager を使わず、システムパスの driver を使う
+             driver = webdriver.Chrome(options=options)
+             # driver.execute_cdp_cmd(...) # <-- 削除 (Cloud環境では不要/不安定なため)
              driver.set_page_load_timeout(30)
              status_container.success("ブラウザの起動が完了しました。")
+        # --- ▲▲▲ Streamlit Cloud デプロイ用に修正 ▲▲▲ ---
         except Exception as e_setup:
              st.error(f"WebDriverの起動に失敗しました: {e_setup}")
              yield 1.0, "ブラウザ起動エラー", df
