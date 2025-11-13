@@ -1,4 +1,4 @@
-# app.py (ファイル名: 電話番号補完アプリ_v23_modified.py)
+# app.py (ファイル名: 電話番号補完アプリ_v23_modified_batch.py)
 import streamlit as st
 import pandas as pd
 import time
@@ -112,12 +112,10 @@ def extract_phone_number(soup, area_codes_set, sorted_area_codes):
 def search_yahoo_search_phone(driver, facility_name, address, status_container):
     """Yahoo検索結果ページから施設名と住所で電話番号を探す"""
     phone_number = 'N/A'
-    # ▼▼▼ 修正: 'nan' もチェック対象に追加 ▼▼▼
     if not facility_name or facility_name.lower() in ['n/a', 'アクセスエラー', '抽出エラー', 'nan', ''] or \
        not address or address.lower() in ['n/a', 'アクセスエラー', '抽出エラー', 'nan', '']:
         status_container.info(f" -> 屋号/住所が無効なためYahoo検索(ダイレクト)スキップ。(屋号: {facility_name}, 住所: {address})")
         return phone_number
-    # ▲▲▲ ここまで修正 ▲▲▲
 
     clean_facility_name = re.sub(r'【.*?】|\(.*?\)|（.*?）|の.*?求人.*', '', facility_name).strip()
     if not clean_facility_name:
@@ -229,8 +227,49 @@ def search_yahoo_for_phone(query, driver, area_codes_set, sorted_area_codes, sta
         status_container.error(f"(予備) Yahoo検索(一覧)中に予期せぬエラー: {e}")
         return None
 
+# --- ★★★ (新) ブラウザ起動関数 ★★★ ---
+# 元の処理からブラウザ起動ロジックを分離
+def initialize_driver(status_container, proxy_settings, disable_headless):
+    """WebDriverインスタンスを初期化して返す"""
+    try:
+        status_container.info("ブラウザを起動しています...");
+        options = Options()
+        options.add_argument(f'user-agent={random.choice(USER_AGENTS)}')
+        options.add_argument('--blink-settings=imagesEnabled=false')
+        options.add_argument(f'--window-size=1920,1980')
+        options.add_argument('--disable-gpu'); options.add_argument('--lang=ja-JP,ja;q=0.9')
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"]); options.add_experimental_option('useAutomationExtension', False)
 
-# --- ★★★ メイン処理: run_scraping_process ★★★ ---
+        proxy_values = {k: v for k, v in proxy_settings.items() if v}
+        if all(k in proxy_values for k in ['proxy_host', 'proxy_port', 'proxy_user', 'proxy_pass']):
+            try:
+                options.add_extension(io.BytesIO(create_proxy_extension(**proxy_values)))
+                status_container.info("プロキシ設定を適用しました。")
+            except Exception as e:
+                st.error(f"プロキシ設定エラー: {e}")
+
+        # --- Streamlit Cloud デプロイ用設定 ---
+        options.add_argument('--headless=new') # ヘッドレスモードを強制
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+
+        if not disable_headless:
+            st.info("（デプロイ環境ではヘッドレスモードが強制されます）")
+        
+        # システムパスの driver を使う
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(30)
+        status_container.success("ブラウザの起動が完了しました。")
+        return driver
+    
+    except Exception as e_setup:
+        st.error(f"WebDriverの起動に失敗しました: {e_setup}")
+        return None
+
+
+# --- ★★★ メイン処理: run_scraping_process (バッチ処理対応版) ★★★ ---
 def run_scraping_process(df, status_container, proxy_settings, disable_headless, area_codes_set):
 
     phone_column_name = '電話番号'
@@ -246,13 +285,15 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
          yield 1.0, "列名エラー(電話番号)", df
          return
     
-    # ▼▼▼ 修正: 列存在の警告を移動 ▼▼▼
-    # if not (actual_company_col and actual_address_col):
-    #     st.warning(f"注意: CSVに会社名({', '.join(company_name_cols)})または住所({', '.join(address_cols)})列が見つからないため、Yahoo検索は実行されません。")
-    # ▲▲▲ ここまで修正 ▲▲▲
-
     sleep_times = {"visit": (1.5, 2.5), "decoy": (1, 2), "loop": (1, 2)}
-    driver = None
+    
+    # ▼▼▼ バッチ処理（メモリ対策）設定 ▼▼▼
+    # BATCH_SIZE件処理するごとにブラウザを再起動する
+    # (調整可能: 30〜100程度で試してください)
+    BATCH_SIZE = 50 
+    # ▲▲▲ ここまで追加 ▲▲▲
+    
+    driver = None # driver変数を初期化
 
     target_indices = df[
         (df[phone_column_name].isnull() | (df[phone_column_name] == ''))
@@ -267,70 +308,53 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
     sorted_area_codes = sorted(area_codes_set, key=len, reverse=True)
     df_copy = df.copy()
     processed_count = 0
+    processed_in_batch = 0 # バッチ内で何件処理したか
 
     try:
-        status_container.info("ブラウザを起動しています...");
-        options = Options()
-        options.add_argument(f'user-agent={random.choice(USER_AGENTS)}')
-        options.add_argument('--blink-settings=imagesEnabled=false')
-        # if not disable_headless: options.add_argument('--headless=new') # <-- 元のコード
-        options.add_argument(f'--window-size=1920,1980')
-        options.add_argument('--disable-gpu'); options.add_argument('--lang=ja-JP,ja;q=0.9')
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"]); options.add_experimental_option('useAutomationExtension', False)
+        # 最初に一度だけブラウザを起動
+        driver = initialize_driver(status_container, proxy_settings, disable_headless)
+        if driver is None:
+            yield 1.0, "ブラウザ起動エラー", df
+            return
 
-        proxy_values = {k: v for k, v in proxy_settings.items() if v}
-        if all(k in proxy_values for k in ['proxy_host', 'proxy_port', 'proxy_user', 'proxy_pass']):
-            try:
-                options.add_extension(io.BytesIO(create_proxy_extension(**proxy_values)))
-                status_container.info("プロキシ設定を適用しました。")
-            except Exception as e:
-                st.error(f"プロキシ設定エラー: {e}")
-
-        # --- ▼▼▼ Streamlit Cloud デプロイ用に修正 ▼▼▼ ---
-        options.add_argument('--headless=new') # ヘッドレスモードを強制
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-
-        if not disable_headless:
-            st.info("（デプロイ環境ではヘッドレスモードが強制されます）")
-        
-        try: 
-             # service = Service(ChromeDriverManager().install()); # <-- 削除
-             # webdriver-manager を使わず、システムパスの driver を使う
-             driver = webdriver.Chrome(options=options)
-             # driver.execute_cdp_cmd(...) # <-- 削除 (Cloud環境では不要/不安定なため)
-             driver.set_page_load_timeout(30)
-             status_container.success("ブラウザの起動が完了しました。")
-        # --- ▲▲▲ Streamlit Cloud デプロイ用に修正 ▲▲▲ ---
-        except Exception as e_setup:
-             st.error(f"WebDriverの起動に失敗しました: {e_setup}")
-             yield 1.0, "ブラウザ起動エラー", df
-             return
-
-
+        # target_indices のリストに対してループ
         for index in target_indices:
             processed_count += 1
+            processed_in_batch += 1
             progress_rate = processed_count / total_jobs
             yield progress_rate, f"{processed_count}/{total_jobs}件目 処理中", None
+
+            # --- ▼▼▼ メモリ対策：バッチサイズに達したらブラウザを再起動 ▼▼▼ ---
+            if processed_in_batch > BATCH_SIZE:
+                status_container.warning(f"--- {BATCH_SIZE}件処理完了。メモリ解放のためブラウザを再起動します ---")
+                if driver:
+                    driver.quit()
+                    driver = None
+                    time.sleep(3) # 安定化のため待機
+                
+                driver = initialize_driver(status_container, proxy_settings, disable_headless)
+                if driver is None:
+                    st.error("ブラウザの再起動に失敗しました。処理を中断します。")
+                    yield progress_rate, "ブラウザ再起動エラー", df_copy # 途中までの結果を返す
+                    return
+                
+                processed_in_batch = 1 # カウンターをリセット
+                status_container.success("--- ブラウザを再起動しました。処理を再開します ---")
+            # --- ▲▲▲ メモリ対策ここまで ▲▲▲ ---
+
 
             row = df_copy.loc[index]
             company_hp_url = str(row.get(hp_column_name, '')).strip()
             
-            # ▼▼▼ 修正: nan 文字列が入らないようにする & bool チェック追加 ▼▼▼
             company_name_raw = row.get(actual_company_col) if actual_company_col else None
             address_raw = row.get(actual_address_col) if actual_address_col else None
             
-            # pd.notna で None や np.nan をチェックし、かつ空文字でないことを確認
             company_name = str(company_name_raw).strip() if pd.notna(company_name_raw) and str(company_name_raw).strip() else ""
             address = str(address_raw).strip() if pd.notna(address_raw) and str(address_raw).strip() else ""
             
-            # この行の検索にYahoo検索が可能か判定
             yahoo_search_possible_for_this_row = bool(company_name) and bool(address) 
             if not yahoo_search_possible_for_this_row:
                  status_container.info(f" -> 屋号/住所が空欄または無効なため、Yahoo検索はスキップします。 (屋号: '{company_name}', 住所: '{address}')")
-            # ▲▲▲ ここまで修正 ▲▲▲
 
             found_phone = None
             current_search_step = ""
@@ -350,8 +374,7 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
                     except (TimeoutException, WebDriverException) as e:
                         status_container.warning(f"ページロードエラー({current_search_step})。下層ページ検索へ移行: {e}")
                         found_phone = None
-                    except InvalidSessionIdException as e_sid:
-                        status_container.error(f"HPアクセス中にセッション無効: {e_sid}"); raise
+                    # InvalidSessionIdException は外側の try...except でキャッチ
 
                     # --- 概要ページ1 ---
                     if not found_phone:
@@ -387,8 +410,7 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
                             except (TimeoutException, WebDriverException) as e:
                                 status_container.warning(f"ページロードエラー({current_search_step})。下層ページ検索へ移行: {e}")
                                 found_phone = None
-                            except InvalidSessionIdException as e_sid:
-                                status_container.error(f"概要1アクセス中にセッション無効: {e_sid}"); raise
+                            # InvalidSessionIdException は外側の try...except でキャッチ
 
                             # --- 概要ページ2 ---
                             if not found_phone:
@@ -428,12 +450,11 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
                                     except (TimeoutException, WebDriverException) as e:
                                         status_container.warning(f"ページロードエラー({current_search_step})。Yahoo検索へ移行: {e}")
                                         found_phone = None
-                                    except InvalidSessionIdException as e_sid:
-                                         status_container.error(f"概要2アクセス中にセッション無効: {e_sid}"); raise
+                                    # InvalidSessionIdException は外側の try...except でキャッチ
                 else:
                     status_container.info("「HP」のURLが無効または空です。Yahoo検索を試みます。")
 
-                # --- ▼▼▼ 修正: yahoo_search_possible_for_this_row でチェック ▼▼▼ ---
+                # --- Yahoo検索 (HPで見つからない or HPがない場合) ---
                 if not found_phone:
                     if yahoo_search_possible_for_this_row:
                         status_container.info("企業HPから番号が見つからなかったか「HP」がありません。Yahoo検索(ダイレクト)で補完します...")
@@ -444,7 +465,7 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
                         else:
                             found_phone = None
                     else:
-                         status_container.warning("会社名(屋号)/住所が無効なため、Yahoo検索(ダイレクト)はスキップします。")
+                        status_container.warning("会社名(屋号)/住所が無効なため、Yahoo検索(ダイレクト)はスキップします。")
 
                 if not found_phone:
                     if yahoo_search_possible_for_this_row:
@@ -460,9 +481,8 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
                         else:
                             status_container.warning("(予備)Yahoo検索(一覧)でも電話番号は見つかりませんでした。")
                     else:
-                         status_container.warning("会社名(屋号)/住所が無効なため、(予備)Yahoo検索(一覧)はスキップします。")
-                # --- ▲▲▲ ここまで修正 ▲▲▲ ---
-
+                        status_container.warning("会社名(屋号)/住所が無効なため、(予備)Yahoo検索(一覧)はスキップします。")
+                
                 # --- 抽出結果の記録 ---
                 if found_phone:
                     df_copy.loc[index, phone_column_name] = found_phone
@@ -470,12 +490,49 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
                     df_copy.loc[index, phone_column_name] = '見つかりません'
 
             except InvalidSessionIdException as e_sid:
+                # --- ▼▼▼ (修正) セッションエラー時の再起動処理 ▼▼▼ ---
                 st.error(f"処理中にセッションが無効になりました: {e_sid}")
-                st.warning("処理を中断します。再度実行してください。")
-                break
+                st.warning("ブラウザを再起動して次の処理を試みます。")
+                
+                if driver:
+                    driver.quit()
+                    driver = None
+                    time.sleep(3)
+                
+                driver = initialize_driver(status_container, proxy_settings, disable_headless)
+                if driver is None:
+                    st.error("ブラウザの再起動に失敗しました。処理を中断します。")
+                    yield progress_rate, "セッションエラー(再起動失敗)", df_copy
+                    return # 関数を終了
+                
+                df_copy.loc[index, phone_column_name] = 'エラー(セッション)'
+                processed_in_batch = 1 # カウンターリセット
+                # --- ▲▲▲ (修正) ここまで ▲▲▲ ---
+
             except Exception as e:
                 st.error(f"URL処理({current_search_step})中に予期せぬエラー ({company_hp_url}): {e}")
                 df_copy.loc[index, phone_column_name] = f'エラー({current_search_step})'
+
+                # --- ▼▼▼ (追加) WebDriver関連エラーでも再起動を試みる ▼▼▼ ---
+                if "driver" in str(e).lower() or isinstance(e, WebDriverException):
+                    st.warning("WebDriverエラー検出。ブラウザを再起動します。")
+                    try:
+                        if driver:
+                            driver.quit()
+                            driver = None
+                            time.sleep(3)
+                        driver = initialize_driver(status_container, proxy_settings, disable_headless)
+                        if driver is None:
+                            st.error("ブラウザの再起動に失敗しました。処理を中断します。")
+                            yield progress_rate, "WebDriverエラー(再起動失敗)", df_copy
+                            return # 関数を終了
+                        processed_in_batch = 1 # カウンターリセット
+                    except Exception as e_restart:
+                        st.error(f"再起動中に致命的エラー: {e_restart}。処理を中断します。")
+                        yield progress_rate, "WebDriverエラー(再起動失敗)", df_copy
+                        return # 関数を終了
+                # --- ▲▲▲ (追加) ここまで ▲▲▲ ---
+
 
             # --- (デコイ処理) ---
             if processed_count % 5 == 0 and processed_count > 0:
@@ -488,29 +545,33 @@ def run_scraping_process(df, status_container, proxy_settings, disable_headless,
                         time.sleep(random.uniform(*sleep_times["decoy"]))
                     except (TimeoutException, WebDriverException) as e:
                         status_container.warning(f"デコイアクセスでエラー（タイムアウト等）: {e}")
-                    except InvalidSessionIdException as e_sid:
-                         status_container.error(f"デコイアクセス中にセッション無効: {e_sid}"); raise
+                    # InvalidSessionIdException は外側の try...except でキャッチ
                     except Exception as e_decoy:
                         status_container.warning(f"デコイアクセスで予期せぬエラー: {e_decoy}")
                 except Exception as e_outer:
-                     status_container.warning(f"デコイ処理全体でエラー: {e_outer}")
+                    status_container.warning(f"デコイ処理全体でエラー: {e_outer}")
 
 
             time.sleep(random.uniform(*sleep_times["loop"]))
+        
+        # --- ループ正常終了 ---
+        yield 1.0, "完了！", df_copy
 
-    except InvalidSessionIdException as e_sid:
-       st.error(f"処理の途中でブラウザセッションが無効になりました: {e_sid}")
-       st.warning("途中までの結果を出力します。")
-       driver = None
+    except Exception as e_main:
+        # メインループの外側での予期せぬエラー
+        st.error(f"処理全体で致命的なエラーが発生しました: {e_main}")
+        yield 1.0, "致命的エラー", df_copy # 途中までの結果を返す
+        
     finally:
-       if driver: driver.quit()
+        if driver:
+            driver.quit()
+            status_container.info("最終処理完了。ブラウザを終了しました。")
 
-    yield 1.0, "完了！", df_copy
 
-# --- ▼▼▼ Streamlit UI部分 ▼▼▼ ---
+# --- ▼▼▼ Streamlit UI部分 (変更なし) ▼▼▼ ---
 st.set_page_config(page_title="電話番号 補完アプリ", layout="centered")
 st.title('🤖 電話番号 自動補完アプリ')
-st.markdown("CSVまたはExcelの「HP」「屋号」「住所/所在地」を元に、空欄の「電話番号」列を自動で補完します。") # ラベルを変更
+st.markdown("CSVまたはExcelの「HP」「屋号」「住所/所在地」を元に、空欄の「電話番号」列を自動で補完します。")
 st.sidebar.title("⚙️ 動作設定")
 disable_headless = st.sidebar.checkbox("ヘッドレスモードを無効化（デバッグ用）")
 with st.sidebar.expander("プロキシ設定（上級者向け）", expanded=False):
@@ -525,9 +586,7 @@ results_placeholder, download_placeholder = st.empty(), st.empty()
 
 AREA_CODE_CSV_PATH = "市外局番リスト.csv"
 
-# ▼▼▼ 修正: type=["csv", "xlsx", "xls"] に変更 ▼▼▼
 if uploaded_file := st.file_uploader("処理対象ファイル (電話番号, [HP], [屋号], [住所/所在地] 列を含む) をアップロード", type=["csv", "xlsx", "xls"]):
-# ▲▲▲ ここまで修正 ▲▲▲
 
     if st.button('処理開始'):
 
@@ -559,7 +618,6 @@ if uploaded_file := st.file_uploader("処理対象ファイル (電話番号, [H
             st.error(f"市外局番リストの読み込み中に致命的なエラーが発生しました: {e}")
             st.stop()
 
-        # ▼▼▼ 修正: ファイル読み込み部分を拡張子で分岐 ▼▼▼
         try:
             original_filename = uploaded_file.name
             
@@ -590,7 +648,6 @@ if uploaded_file := st.file_uploader("処理対象ファイル (電話番号, [H
         except Exception as e:
             st.error(f"ファイル ({original_filename}) の読み込みに失敗しました: {e}")
             st.stop()
-        # ▲▲▲ ここまで修正 ▲▲▲
 
         p_bar.progress(0); status_container = st.expander("詳細ログ", expanded=True)
         start_time = time.time()
@@ -603,10 +660,8 @@ if uploaded_file := st.file_uploader("処理対象ファイル (電話番号, [H
         actual_company_col = next((col for col in company_name_cols if col in df.columns), None)
         actual_address_col = next((col for col in address_cols if col in df.columns), None)
         
-        # ▼▼▼ 修正: 列存在の警告をここに移動 ▼▼▼
         if not (actual_company_col and actual_address_col):
             st.warning(f"注意: CSVに会社名({', '.join(company_name_cols)})または住所({', '.join(address_cols)})列が見つからないため、Yahoo検索は実行されません。")
-        # ▲▲▲ ここまで修正 ▲▲▲
 
         total_jobs_for_eta = 0
         if phone_col in df.columns:
